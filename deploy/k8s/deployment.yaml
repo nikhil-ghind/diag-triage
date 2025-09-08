@@ -1,0 +1,82 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: diag-triage-config
+data:
+  DIAG_ES_HOSTS: '["http://diag-elasticsearch:9200"]'
+  DIAG_MODEL: "claude-opus-4-7"
+  DIAG_DETECT_WINDOW_S: "300"
+  DIAG_RATE_SPIKE_ZSCORE: "3.0"
+  DIAG_ALERT_THROTTLE_S: "900"
+  DIAG_LOG_LEVEL: "info"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: diag-triage-secrets
+type: Opaque
+stringData:
+  # Populate via your secret manager / sealed-secrets; placeholders here.
+  DIAG_ANTHROPIC_API_KEY: "REPLACE_ME"
+  DIAG_SLACK_WEBHOOK_URL: ""
+  DIAG_PAGERDUTY_ROUTING_KEY: ""
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: diag-triage
+  labels: { app: diag-triage }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: diag-triage }
+  template:
+    metadata:
+      labels: { app: diag-triage }
+    spec:
+      containers:
+        - name: triage
+          image: ghcr.io/nikhil-ghind/diag-triage:latest
+          command: ["diag-triage", "serve"]
+          ports:
+            - { containerPort: 8080, name: http }
+          envFrom:
+            - configMapRef: { name: diag-triage-config }
+            - secretRef: { name: diag-triage-secrets }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits:   { cpu: "1", memory: 1Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: diag-triage
+spec:
+  selector: { app: diag-triage }
+  ports:
+    - { port: 80, targetPort: 8080 }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: diag-triage
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: diag-triage
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }
