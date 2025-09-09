@@ -12,18 +12,60 @@ incident*, after a fleet-wide fault has been collapsed to a single cluster.
 
 ---
 
-## What it does
+## Architecture
 
+<img src="docs/triage-flow.svg" alt="Log lines from many hosts parsed, normalized to a signature, clustered into one incident, triaged by the agent and routed to alert sinks" width="880">
+
+```mermaid
+flowchart TB
+    HF["host forwarders<br/>dmesg / journald / Filebeat"] -->|"POST /v1/ingest"| API["FastAPI (triage/app/main.py)<br/>one TriageService instance"]
+    API --> PIPE["IngestPipeline.ingest_raw"]
+    PIPE --> PARSE["parse_line<br/>classify subsystem + severity,<br/>normalize_signature masks hex, PCI ids, UUIDs, counters"]
+    PARSE --> BULK["ESClient.bulk_index_logs<br/>_id = event_id so replays are idempotent"]
+    BULK --> ESL[("diag-logs index")]
+    BULK --> REFRESH["indices.refresh so rate aggs see the batch"]
+    REFRESH --> DET["Detector.detect<br/>severity/subsystem rules + rate_zscore over bucketed counts"]
+    DET --> CLUS["Detector.cluster<br/>group failures by (subsystem, signature)"]
+    CLUS --> INC["Incident<br/>fingerprint, hosts, count, severity"]
+    INC --> UPS["ESClient.upsert_incident"]
+    UPS --> ESI[("diag-incidents index")]
+
+    INC --> AGENT["TriageAgent.triage<br/>bounded tool-use loop, agent_max_tool_turns"]
+    AGENT --> LLM["LLMClient (Claude)<br/>system prompt + tool defs cached as ephemeral;<br/>offline stub for tests"]
+    AGENT --> TOOLS["Tools dispatch<br/>search_logs, host_health,<br/>signature_rate, similar_incidents"]
+    TOOLS --> ESL
+    TOOLS --> ESI
+    MCP["python -m triage.mcp.server<br/>same TOOL_SPECS over MCP"] --> TOOLS
+
+    AGENT --> TR["Triage<br/>summary, probable cause, action,<br/>blast radius, confidence, citations"]
+    TR --> ROUTER["AlertRouter.route<br/>throttle per fingerprint, severity-gated channels"]
+    ROUTER --> PD["PagerDutySink<br/>critical"]
+    ROUTER --> SL["SlackSink<br/>critical + error + confident warnings"]
+    ROUTER --> LG["LogSink<br/>everything else"]
 ```
-host forwarders ─POST /v1/ingest─► parse → index (ES) → detect → cluster
-                                                              │
-                                                       incident(s)
-                                                              ▼
-                                        Claude agent (MCP tools over ES)
-                                                              ▼
-                                       Triage{cause, action, blast radius}
-                                                              ▼
-                                  router → Slack / PagerDuty / log  (dedup+throttle)
+
+The agent's hot path, one incident at a time:
+
+```mermaid
+sequenceDiagram
+    participant S as TriageService
+    participant A as TriageAgent
+    participant M as Claude
+    participant T as Tools
+    participant E as Elasticsearch
+    S->>A: triage(incident)
+    A->>M: system prompt + TOOL_SPECS + submit_triage + incident JSON
+    loop up to agent_max_tool_turns
+        M-->>A: tool_use blocks
+        A->>T: call(name, args)
+        T->>E: search / aggregate
+        E-->>T: hits and buckets
+        T-->>A: JSON result
+        A->>M: tool_result blocks
+    end
+    M-->>A: submit_triage(input)
+    A-->>S: Triage (or _fallback if the loop is exhausted)
+    S->>S: AlertRouter.route(incident, triage)
 ```
 
 Full design rationale in [`docs/architecture.md`](docs/architecture.md).
