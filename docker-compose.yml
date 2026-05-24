@@ -1,0 +1,29 @@
+# Local stack: single-node Elasticsearch + the triage service.
+# `docker compose up` then `python scripts/seed_logs.py --scenario gpu-xid`.
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  triage:
+    build: .
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      - DIAG_ES_HOSTS=["http://elasticsearch:9200"]
+      - DIAG_ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - DIAG_LLM_OFFLINE=${DIAG_LLM_OFFLINE:-false}
+      - DIAG_SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+    ports:
+      - "8080:8080"
